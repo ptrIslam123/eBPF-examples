@@ -1,41 +1,24 @@
-# Compilation configuration
-CXX ?= g++
-CXXFLAGS ?= -std=c++17 -O2 -g -Wall -Wextra
-LDFLAGS ?=
-
-# Paths and libraries
+CXX = g++
+CXXFLAGS = -std=c++17 -O2 -g -Wall -Wextra
 XDP_LIBS = -lxdp -lbpf -lpthread
 XDP_INCLUDES = -I/usr/include/xdp -I/usr/include/bpf
-IFNAME ?= lo
-QUEUE_ID ?= 0
 
-# File names
 TARGET = xdp_app
 SRC = main.cpp
-OBJ = $(SRC:.cpp=.o)
 
-# Default targets
-all: $(TARGET)
+.PHONY: all clean run
 
-# Main build
-$(TARGET): $(OBJ)
-	$(CXX) $(CXXFLAGS) -o $@ $^ $(XDP_LIBS) $(LDFLAGS)
+compile: $(TARGET)
 
-main.o: main.cpp
-	$(CXX) $(CXXFLAGS) $(XDP_INCLUDES) -c $< -o $@
+$(TARGET): $(SRC)
+	$(CXX) $(CXXFLAGS) $(XDP_INCLUDES) -o $@ $< $(XDP_LIBS)
 
-# Run program
 run: $(TARGET)
-	@echo "=== Running AF_XDP program ==="
-	@echo "Interface: $(IFNAME)"
-	@echo "Queue: $(QUEUE_ID)"
-	@echo ""
-	sudo ./$(TARGET)
+	sudo ./$(TARGET) --iface veth0 --queue 0
 
-# Clean
 clean:
-	rm -f $(OBJ) $(TARGET)
-
+	rm -f $(TARGET) *.o
+	
 # Clean all objects (including eBPF)
 clean-all: clean
 	@echo "Cleaning eBPF objects..."

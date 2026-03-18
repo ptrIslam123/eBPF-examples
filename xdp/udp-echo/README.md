@@ -2,7 +2,7 @@
 
 A minimal demonstration of high-performance packet processing using eBPF XDP and AF_XDP sockets for zero-copy packet transfer between kernel and userspace.
 
-## 📋 Overview
+## Overview
 
 This project showcases:
 - **eBPF XDP program** running in kernel space that redirects packets
@@ -34,21 +34,26 @@ sudo apt install clang llvm libbpf-dev libxdp-dev \
 cd src/uspace && make check-deps
 ```
 
-### 1. Load eBPF Program
+#### 1. kpace
 ```bash
-cd src/kspace
-make all              # Compile and load eBPF program
-make check           # Verify everything loaded correctly
+cd kspace
+# create a veth-pair iface for test
+make add-veth
+# for the first call this command will prepare and setup xdp redirect program
+make reload-veth
+# trace kernel pipe
+make trace
 ```
 
-### 2. Run Userspace Application
+#### 2. upsace
 ```bash
-cd src/uspace
-make run            # Compile and run AF_XDP app
+cd uspace
+make compile
+make run-veth
 ```
 
-### 3. Generate Test Traffic
+#### 3. ping
 ```bash
-# In another terminal
-ping -c 3 127.0.0.1
+cd kpace
+make ping-veth
 ```
