@@ -1,12 +1,6 @@
-# Configuration
-CLANG ?= clang
-BPF_CFLAGS = -O2 -g -Wall -target bpf \
-             -D__KERNEL__ \
-             -I/usr/include \
-             -I/usr/include/x86_64-linux-gnu
-INGRESS_KPROG=kprog.ingress
-EGRESS_KPROG=kprog.egress
 
+# Working veth pair with external connectivity
+# Based on the proven bash script
 
 NS := test_ns
 VETH1 := veth1
@@ -15,17 +9,8 @@ VETH1_IP := 10.10.0.1
 VETH2_IP := 10.10.0.2
 NETMASK := 24
 NETWORK := 10.10.0.0/24
-NET_NS_EXEC = ip netns exec $(NET_NS)
 
-# Colors for output
-GREEN = \033[0;32m
-RED = \033[0;31m
-YELLOW = \033[1;33m
-BLUE = \033[0;34m
-NC = \033[0m # No Color
-
-https-test:
-	sudo $(NET_NS1_EXEC) curl https://cppreference.com
+.PHONY: setup cleanup status test shell
 
 setup:
 	@# Check if namespace already exists
@@ -82,7 +67,7 @@ status:
 	@echo "=== IP Forwarding ==="
 	@cat /proc/sys/net/ipv4/ip_forward
 
-test-network:
+test:
 	@echo "Testing connectivity..."
 	@echo -n "  Namespace -> host: "
 	@ip netns exec $(NS) ping -c 1 -W 1 $(VETH2_IP) >/dev/null 2>&1 && echo "✓ OK" || echo "✗ FAILED"
@@ -91,63 +76,7 @@ test-network:
 	@echo -n "  Namespace -> google.com: "
 	@ip netns exec $(NS) ping -c 1 -W 2 google.com >/dev/null 2>&1 && echo "✓ OK" || echo "✗ FAILED"
 
-
-# Очистка
-cleanup-network:
-	@echo "$(BLUE)=== Cleaning up ===$(NC)"
-	sudo ip netns del $(NET_NS0) 2>/dev/null || true
-	sudo ip netns del $(NET_NS1) 2>/dev/null || true
-	sudo ip link delete $(VETH0) 2>/dev/null || true
-	@echo "$(GREEN)Cleanup complete$(NC)"
-
-# Быстрый перезапуск
-restart-network:
-	make cleanup-network
-	make setup-network
-
-# Остальные ваши цели для eBPF
-reload-bpf:
-	make clean
-	make compile
-	make unload
-	make load
-
-# Загрузка TC eBPF программы
-load-bpf:
-	# 1. Создаем/заменяем clsact qdisc
-	sudo tc qdisc add dev $(VETH1) clsact 2>/dev/null || \
-	sudo tc qdisc replace dev $(VETH1) clsact
-	
-	# 2. Загружаем программу на ingress
-	sudo tc filter add dev $(VETH1) ingress bpf da obj $(INGRESS_KPROG).o sec tc/ingress
-	
-	# 3. Загружаем программу на egress
-	sudo tc filter add dev $(VETH1) egress bpf da obj $(EGRESS_KPROG).o sec tc/egress
-	
-	@echo "TC eBPF loaded on $(VETH1)"
-
-# Выгрузка TC eBPF программы
-unload-bpf:
-	sudo tc qdisc del dev $(VETH1) clsact 2>/dev/null || true
-	@echo "TC eBPF unloaded from $(VETH1)"
-
-# Compile eBPF program
-compile: $(INGRESS_KPROG).o $(EGRESS_KPROG).o
-
-%.o: %.c
-	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
-
-# Тестирование connectivity
-test-network:
-	@echo "$(BLUE)=== Testing connectivity ===$(NC)"
-	@echo "$(GREEN)Ping from $(NET_NS0) to $(NET_NS1) ($(VETH1_IP))$(NC)"
-	sudo $(NET_NS0_EXEC) ping -I $(VETH0) -c 2 $(VETH1_IP) || echo "$(RED)Ping failed$(NC)"
-	@echo ""
-	@echo "$(GREEN)Ping from $(NET_NS1) to $(NET_NS0) ($(VETH0_IP))$(NC)"
-	sudo $(NET_NS1_EXEC) ping -I $(VETH1) -c 2 $(VETH0_IP) || echo "$(RED)Ping failed$(NC)"
-
-trace:
-	sudo cat /sys/kernel/debug/tracing/trace_pipe
-
-clean:
-	rm -f *.o
+shell:
+	@echo "Entering namespace $(NS)..."
+	@echo "Try: ping 8.8.8.8"
+	@ip netns exec $(NS) bash --rcfile <(echo "PS1='$(NS)> '")
