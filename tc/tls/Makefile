@@ -8,7 +8,7 @@ INGRESS_KPROG=kprog.ingress
 EGRESS_KPROG=kprog.egress
 
 
-NS := test_ns
+NET_NS := test_ns
 VETH1 := veth1
 VETH2 := veth2
 VETH1_IP := 10.10.0.1
@@ -24,81 +24,84 @@ YELLOW = \033[1;33m
 BLUE = \033[0;34m
 NC = \033[0m # No Color
 
-https-test:
-	sudo $(NET_NS1_EXEC) curl https://cppreference.com
+tcp-dump-$(VETH2):
+	sudo $(NET_NS_EXEC) tcpdump -i $(VETH2) -vv tcp
 
-setup:
+tcp-dump-$(VETH1):
+	sudo tcpdump -i $(VETH1) -vv tcp
+
+
+tcp-ping:
+	#echo "hello world" | nc -s 10.10.0.1 -p 12345 10.10.0.2 9999
+	python tcp-sender.py --src-ip $(VETH1_IP) --dst-ip $(VETH2_IP) --src-port 1234 --dst-port 4321 --message "Hello wold"
+
+tcp-echo-server:
+	#sudo ip netns exec test_ns ncat -l -p 9999 -k -c 'cat'
+	sudo $(NET_NS_EXEC) python tcp-server.py --port 4321
+
+https-test:
+	sudo $(NET_NS_EXEC) curl https://example.com  #https://cppreference.com
+
+setup-network:
 	@# Check if namespace already exists
-	@if ip netns exec $(NS) true 2>/dev/null; then \
-		echo "ERROR: namespace $(NS) already exists" >&2; \
+	@if sudo ip netns exec $(NET_NS) true 2>/dev/null; then \
+		echo "ERROR: namespace $(NET_NS) already exists" >&2; \
 		exit 1; \
 	fi
 	@# Create namespace
-	ip netns add $(NS)
+	sudo ip netns add $(NET_NS)
 	@# Create veth pair with one end in namespace
-	ip link add $(VETH1) type veth peer name $(VETH2) netns $(NS)
+	sudo ip link add $(VETH1) type veth peer name $(VETH2) netns $(NET_NS)
 	@# Configure host side
-	ip addr add $(VETH1_IP)/$(NETMASK) dev $(VETH1)
-	ip link set $(VETH1) up
+	sudo ip addr add $(VETH1_IP)/$(NETMASK) dev $(VETH1)
+	sudo ip link set $(VETH1) up
 	@# Configure namespace side
-	ip -n $(NS) addr add $(VETH2_IP)/$(NETMASK) dev $(VETH2)
-	ip -n $(NS) link set $(VETH2) up
-	ip -n $(NS) route add default via $(VETH1_IP)
+	sudo ip -n $(NET_NS) addr add $(VETH2_IP)/$(NETMASK) dev $(VETH2)
+	sudo ip -n $(NET_NS) link set $(VETH2) up
+	sudo ip -n $(NET_NS) route add default via $(VETH1_IP)
 	@# Enable IP forwarding
-	echo 1 > /proc/sys/net/ipv4/ip_forward
-	@# Add NAT with exclusion for veth interface (critical!)
-	iptables -t nat -A POSTROUTING -s $(NETWORK) -j LOG
-	iptables -t nat -A POSTROUTING -s $(NETWORK) ! -o $(VETH1) -j MASQUERADE
+	echo 1 | sudo tee /proc/sys/net/ipv4/ip_forward > /dev/null
+	@# Add NAT (exclude traffic going out veth1 to avoid loop)
+	sudo iptables -t nat -A POSTROUTING -s $(NETWORK) ! -o $(VETH1) -j MASQUERADE
 	@echo ""
 	@echo "✓ veth pair setup complete"
 	@echo "  Host: $(VETH1) = $(VETH1_IP)"
-	@echo "  Namespace: $(NS) = $(VETH2_IP) (via $(VETH2))"
+	@echo "  Namespace: $(NET_NS) = $(VETH2_IP) (via $(VETH2))"
 	@echo ""
-	@echo "Test: sudo ip netns exec $(NS) ping 8.8.8.8"
+	@echo "Test: sudo ip netns exec $(NET_NS) ping 8.8.8.8"
 
-cleanup:
-	@# Delete namespace (removes veth automatically)
-	-ip netns delete $(NS) 2>/dev/null
-	@# Delete host veth if it still exists
-	-ip link delete $(VETH2) 2>/dev/null
-	@# Remove iptables rules
-	-iptables -t nat -D POSTROUTING -s $(NETWORK) -j LOG 2>/dev/null
-	-iptables -t nat -D POSTROUTING -s $(NETWORK) ! -o $(VETH1) -j MASQUERADE 2>/dev/null
+cleanup-network:
+	@# Remove iptables rules (ignore if they don't exist)
+	-sudo iptables -t nat -D POSTROUTING -s $(NETWORK) ! -o $(VETH1) -j MASQUERADE 2>/dev/null
+	@# Delete namespace (ignore if it doesn't exist)
+	-sudo ip netns delete $(NET_NS) 2>/dev/null
+	@# Clean up host veth if needed
+	-sudo ip link delete $(VETH1) 2>/dev/null
 	@echo "✓ Cleanup complete"
 
 status:
 	@echo "=== Namespace ==="
-	@ip netns list | grep $(NS) || echo "Namespace not found"
+	@sudo ip netns list | grep $(NET_NS) || echo "Namespace not found"
 	@echo ""
-	@echo "=== Host veth ==="
-	@ip addr show $(VETH1) 2>/dev/null || echo "veth not found"
+	@echo "=== Host $(VETH1) ==="
+	@sudo ip addr show $(VETH1) 2>/dev/null || echo "veth not found"
 	@echo ""
 	@echo "=== Namespace interfaces ==="
-	@ip -n $(NS) addr show 2>/dev/null || echo "Cannot access namespace"
+	@sudo ip -n $(NET_NS) addr show 2>/dev/null || echo "Cannot access namespace"
 	@echo ""
 	@echo "=== Routes in namespace ==="
-	@ip -n $(NS) route show 2>/dev/null || echo "No routes"
+	@sudo ip -n $(NET_NS) route show 2>/dev/null || echo "No routes"
 	@echo ""
 	@echo "=== IP Forwarding ==="
 	@cat /proc/sys/net/ipv4/ip_forward
 
+
+# Тестирование connectivity
 test-network:
-	@echo "Testing connectivity..."
-	@echo -n "  Namespace -> host: "
-	@ip netns exec $(NS) ping -c 1 -W 1 $(VETH2_IP) >/dev/null 2>&1 && echo "✓ OK" || echo "✗ FAILED"
-	@echo -n "  Namespace -> 8.8.8.8: "
-	@ip netns exec $(NS) ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1 && echo "✓ OK" || echo "✗ FAILED"
-	@echo -n "  Namespace -> google.com: "
-	@ip netns exec $(NS) ping -c 1 -W 2 google.com >/dev/null 2>&1 && echo "✓ OK" || echo "✗ FAILED"
+	@echo "$(BLUE)=== Testing connectivity ===$(NC)"
+	sudo $(NET_NS_EXEC) ping 8.8.8.8 -c 2
+	sudo $(NET_NS_EXEC) ping -I $(VETH2) $(VETH1_IP) -c 2
 
-
-# Очистка
-cleanup-network:
-	@echo "$(BLUE)=== Cleaning up ===$(NC)"
-	sudo ip netns del $(NET_NS0) 2>/dev/null || true
-	sudo ip netns del $(NET_NS1) 2>/dev/null || true
-	sudo ip link delete $(VETH0) 2>/dev/null || true
-	@echo "$(GREEN)Cleanup complete$(NC)"
 
 # Быстрый перезапуск
 restart-network:
@@ -109,8 +112,8 @@ restart-network:
 reload-bpf:
 	make clean
 	make compile
-	make unload
-	make load
+	make unload-bpf
+	make load-bpf
 
 # Загрузка TC eBPF программы
 load-bpf:
@@ -136,15 +139,6 @@ compile: $(INGRESS_KPROG).o $(EGRESS_KPROG).o
 
 %.o: %.c
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
-
-# Тестирование connectivity
-test-network:
-	@echo "$(BLUE)=== Testing connectivity ===$(NC)"
-	@echo "$(GREEN)Ping from $(NET_NS0) to $(NET_NS1) ($(VETH1_IP))$(NC)"
-	sudo $(NET_NS0_EXEC) ping -I $(VETH0) -c 2 $(VETH1_IP) || echo "$(RED)Ping failed$(NC)"
-	@echo ""
-	@echo "$(GREEN)Ping from $(NET_NS1) to $(NET_NS0) ($(VETH0_IP))$(NC)"
-	sudo $(NET_NS1_EXEC) ping -I $(VETH1) -c 2 $(VETH0_IP) || echo "$(RED)Ping failed$(NC)"
 
 trace:
 	sudo cat /sys/kernel/debug/tracing/trace_pipe
