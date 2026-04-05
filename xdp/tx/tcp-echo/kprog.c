@@ -10,62 +10,54 @@
 
 #include "checksum.h"
 
-
 // License declaration - mandatory for eBPF programs
 // Kernel verifier checks this to ensure GPL compatibility
 char LICENSE[] SEC("license") = "GPL";
-
-static __always_inline void swap_mac(struct ethhdr *eth)
-{
-    __u8 tmp[ETH_ALEN];
-    __builtin_memcpy(tmp, eth->h_dest, ETH_ALEN);
-    __builtin_memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
-    __builtin_memcpy(eth->h_source, tmp, ETH_ALEN);
-}
-
-static __always_inline void swap_ip(struct iphdr *ip)
-{
-    __u32 tmp = ip->saddr;
-    ip->saddr = ip->daddr;
-    ip->daddr = tmp;
-}
-
-static __always_inline void swap_tcp(struct tcphdr *tcp)
-{
-    __u16 tmp = tcp->source;
-    tcp->source = tcp->dest;
-    tcp->dest = tmp;
-}
 
 static __always_inline __u32 generate_isn() {
     return bpf_get_prandom_u32();
 }
 
-static __always_inline int handle_tcp_syn(struct ethhdr *eth, struct iphdr *ip, struct tcphdr *tcp, __u8* data_end) {
-    // Client chooses a random initial sequence number (tcp->seq)
-    // This packet contains:
-    //  * SYN flag = 1
-    //  * Sequence number = tcp->seq
-    //  * No payload (usually)
-    //  * Client's window size, MSS, etc.
+enum tcp_state {
+    TCP_CONNECTION_INITIATED,   // Получен SYN, отправлен SYN-ACK
+    TPC_CONNECTION_ESTABLISHED // Получен финальный ACK от peer
+};
 
-    // Purpose: Client announces it wants to establish a connection and provides its initial sequence number.
+// Ключ для идентификации соединения (4-tuple)
+struct connection_key {
+    __u32 src_ip;      // IP клиента
+    __u32 dst_ip;      // IP сервера
+    __u16 src_port;    // Порт клиента
+    __u16 dst_port;    // Порт сервера (4321)
+};
 
-    //  * SYN = 1, ACK = 1 flags
-    //  * Server's own Initial Sequence Number (tcp->seq).
-    //          Who sets it: The sender of the packet.
-    //          What it represents: The byte number of the first data byte in this packet
-    //          Purpose: Tracks the sender's data bytes.
-    //          Direction: Each direction has its own sequence number space
-    //
-    //  * Acknowledgment Number (ack_seq): Expected: client_seq + 1
-    //          Purpose: Confirms receipt of the other side's data
-    //          Who sets it: The receiver of data (acknowledging what they received)
-    //          What it represents: The byte number that the sender expects to receive next
-    //          Direction: Independent from sequence numbers
+// Минимальное состояние соединения
+struct connection_state {
+    __u32 server_seq;
+    __u32 server_ack_seq;
+    __u32 client_seq;
+    __u32 client_ack_seq;
 
-   __u32 client_seq = bpf_ntohl(tcp->seq);
+    // Состояние TCP
+    __u8 state;            // Текущее состояние (enum tcp_state)
+};
 
+// BPF map для хранения соединений
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 1024);
+    __type(key, struct connection_key);
+    __type(value, struct connection_state);
+} tcp_connections SEC(".maps");
+
+static __always_inline int send_syn_ack(
+    struct ethhdr *eth,
+    struct iphdr *ip,
+    struct tcphdr *tcp,
+    __u8* data_end,
+    __u32 client_isn,
+    __u32 server_isn
+) {
     // Set correct flags (SYN+ACK)
     tcp->syn = 1;
     tcp->ack = 1;
@@ -74,32 +66,33 @@ static __always_inline int handle_tcp_syn(struct ethhdr *eth, struct iphdr *ip, 
     tcp->psh = 0;
     tcp->urg = 0;
 
-    // Set server's own sequence number (MUST be different)
-    __u32 server_isn = generate_isn();  // Different from client_seq
+    // Set server's own sequence number
     tcp->seq = bpf_htonl(server_isn);
 
-    // Set acknowledgment number (MUST be client_seq + 1)
-    tcp->ack_seq = bpf_htonl(client_seq + 1);
+    // Set acknowledgment number (MUST be client_isn + 1)
+    tcp->ack_seq = bpf_htonl(client_isn + 1);
 
     // Set server's window size
-    tcp->window = bpf_htons(65535);  // default window size
+    tcp->window = bpf_htons(65535);
 
     // Set ip TTL
-    ip->ttl = 64; // default ttl
+    ip->ttl = 64;
 
-    // Swap everything first
+    // Swap addresses
     swap_mac(eth);
     swap_ip(ip);
     swap_tcp(tcp);
 
-    // Recalculate TCP checksum
+    // Recalculate checksums
     compute_ipv4_checksum(ip);
     compute_tcp_checksum(ip, (__u16*)tcp, data_end);
-    // Transmit modified packet back out same interface
+
     return XDP_TX;
 }
 
 static __always_inline int handle_tcp_echo(
+    struct connection_key* conn_key,
+    struct connection_state* conn_state,
     struct ethhdr *eth,
     struct iphdr *ip,
     struct tcphdr *tcp,
@@ -110,16 +103,6 @@ static __always_inline int handle_tcp_echo(
     // Check we can read payload (if needed for echo)
     if (payload + payload_len > data_end)
         return XDP_DROP;
-
-    // // Проверка: можем ли прочитать 10 байт (индексы 0-9)
-    // if (payload + 10 > data_end) {
-    //     return XDP_DROP; // или XDP_PASS, если хочешь пропустить короткие
-    // }
-
-    // // Вывод первых 10 байт
-    // for (int i = 0; i < 10; i++) {
-    //     bpf_printk("byte[%d] = 0x%02x (%c)", i, payload[i], payload[i]);
-    // }
 
     // Save original values before swap
     __be32 orig_seq = tcp->seq;
@@ -158,9 +141,280 @@ static __always_inline int handle_tcp_echo(
     Мы ожидаем что peer инициировавший tcp соединение на наш ответ tcp->syn & tcp->ack вернет пакет tcp->ack,
     на него отвечать не нужно, просто отбросим
     */
+   conn_state->state = 0;
+
+   (void)bpf_map_update_elem(&tcp_connections, &conn_key, &conn_state, BPF_NOEXIST);
     return XDP_TX;
 }
 
+/*
+        TCP Connection Establishment Workflow
+
+CLIENT                                       SERVER
+   |                                            |
+   | 1. SYN (seq=x, ISN(random init seqnum))    |
+   |------------------------------------------->|
+   |                                            |
+   | 2. SYN-ACK (seq=y, ack_seq=x+1)            |
+   |<-------------------------------------------|
+   |                                            |
+   | 3. ACK (seq=x+1, ack_seq=y+1)              |
+   |------------------------------------------->|
+   |                                            |
+   |         CONNECTION ESTABLISHED             |
+   |                                            |
+
+    ### Step 1: SYN
+    - The client sends: Packet with the SYN flag
+    - Contains: Sequence number = x (random number)
+
+    ### Step 2: SYN-ACK
+    - The server must send a packet with the SYN + ACK flags
+    - Contains:
+    - Sequence number = y (its own random number)
+    - Acknowledgment number = x + 1
+
+    ### Step 3: ACK
+    - The client sends a final packet with the ACK flag
+    - Sequence number = x + 1
+    - Acknowledgment number = y + 1
+    After this packet, the client and server consider the connection established.
+
+    ## Key Points
+    - ISN (Initial Sequence Number) - Random number, chosen independently by each side
+    - Sequence number (seq) - Number of the first byte of data in this packet
+    - Acknowledgment number (ack) - Number of the next byte expected from the other side
+    - Payload -  Handshake packets typically lack
+*/
+static __always_inline int handle_tcp_syn(struct ethhdr *eth, struct iphdr *ip, struct tcphdr *tcp, __u8* data_end) {
+    struct connection_key key = {
+        .src_ip = ip->saddr,
+        .dst_ip = ip->daddr,
+        .src_port = tcp->source,
+        .dst_port = tcp->dest,
+    };
+    struct connection_state* existing = bpf_map_lookup_elem(&tcp_connections, &key);
+    if (!existing) {
+        // ========== New connection ==========
+
+        __u32 client_seq = bpf_ntohl(tcp->seq);
+        // Set server's own sequence number (MUST be different)
+        __u32 server_isn = generate_isn();  // Different from client_seq
+
+        struct connection_state new = {
+            .seq = client_seq + 1,
+            .ack_seq = server_isn,
+            .state = TCP_CONNECTION_INITIATED,
+        };
+        (void)bpf_map_update_elem(&tcp_connections, &key, &new, BPF_NOEXIST);
+        return send_syn_ack(eth, ip, tcp, data_end, client_seq, server_isn);
+    } else {
+        // ========== Existing conection ==========
+
+        // Handling repeated SYN
+        if (existing->state == TCP_CONNECTION_INITIATED) {
+            // The client did not receive our SYN-ACK, we send it again
+            bpf_printk("Duplicate SYN, resending SYN-ACK for state=%d", existing->state);
+
+            __u32 client_seq = existing->client_seq - 1;  // ISN from client
+            __u32 server_isn = existing->server_seq;
+
+            (void)bpf_map_update_elem(&tcp_connections, &key, existing, BPF_ANY);
+            return send_syn_ack(eth, ip, tcp, data_end, client_seq, server_isn);
+        } else {
+            // The connection is already in a different state - ignore SYN
+            bpf_printk("Ignoring SYN, connection in state=%d", existing->state);
+            return XDP_DROP;
+        }
+    }
+}
+
+static __always_inline int handle_tcp_ack(
+    struct ethhdr *eth,
+    struct iphdr *ip,
+    struct tcphdr *tcp,
+    __u8* payload,
+    __u32 payload_len,
+    __u8* data_end
+) {
+    struct connection_key key = {
+        .src_ip = ip->saddr,
+        .dst_ip = ip->daddr,
+        .src_port = tcp->source,
+        .dst_port = tcp->dest,
+    };
+    struct connection_state* existing = bpf_map_lookup_elem(&tcp_connections, &key);
+    if (!existing) {
+        return XDP_DROP;
+    }
+
+    switch (existing->state) {
+        case TCP_CONNECTION_INITIATED: {
+            // мы получили финальный tcp ACK от peer
+            existing->state = TPC_CONNECTION_ESTABLISHED;
+            bpf_map_update_elem(&tcp_connections, &key, existing, BPF_ANY);
+            return XDP_DROP;
+        }
+        case TPC_CONNECTION_ESTABLISHED: {
+            if (payload_len > 0) {
+                return handle_tcp_echo(&key, existing, eth, ip, tcp, payload, payload_len, data_end);
+            } else if (payload_len == 0) {
+                __u32 client_seq = bpf_ntohl(tcp->seq);
+                __u32 client_ack_seq = bpf_ntohl(tcp->ack_seq);
+                if (existing->seq == client_ack_seq) {
+                    return XDP_DROP;
+                }
+
+
+
+                if (existing->seq !tcp->syn && !tcp->fin && !tcp->rst) {
+                    /*
+                                Client sends ACK to confirm
+                      SERVER                                  CLIENT
+                        |                                         |
+                        | 1. Data (seq=x, len=y)                  |
+                        |---------------------------------------->|
+                        |                                         |
+                        | 2. Pure ACK (ack_seq=x+y, len=0)        |
+                        |<----------------------------------------|
+                        |                                         |
+                    */
+                    // Подтверждение получения наших данных
+                    return XDP_DROP;
+                }
+                // TODO: пока не обрабаотываются эти случаи
+                // Window update ACK (когда изменилось окно)
+                // Keep-alive ACK
+                // DUP ACK (при потере пакетов)
+                return XDP_DROP;
+            }
+        }
+        default:
+            return XDP_DROP;
+    }
+}
+
+static __always_inline int handle_tcp_rst(
+    struct ethhdr *eth,
+    struct iphdr *ip,
+    struct tcphdr *tcp,
+    __u8* payload,
+    __u32 payload_len,
+    __u8* data_end
+) {
+    struct connection_key key = {
+        .src_ip = ip->saddr,
+        .dst_ip = ip->daddr,
+        .src_port = tcp->source,
+        .dst_port = tcp->dest,
+    };
+    struct connection_state *state = bpf_map_lookup_elem(&tcp_connections, &key);
+    if (state) {
+        bpf_printk("Found connection state: client_seq=%u, server_seq=%u, state=%d",
+                   state->client_seq, state->server_seq, state->state);
+        /* Delete connection state immediately */
+        (void)bpf_map_delete_elem(&tcp_connections, &key);
+        bpf_printk("Connection state deleted");
+    } else {
+        bpf_printk("RST for unknown connection");
+    }
+    return XDP_DROP;
+}
+
+/*
+    TCP Connection Termination Workflow (Active Close from Client)
+
+CLIENT                                    SERVER
+   |                                         |
+   | 1. FIN (seq = x, ack = y)               |
+   |---------------------------------------->|
+   |                                         |
+   | 2. ACK (seq = y, ack = x+1)             |
+   |<----------------------------------------|
+   |                                         |
+   | 3. FIN (seq = y, ack = x+1)             |
+   |<----------------------------------------|
+   |                                         |
+   | 4. ACK (seq = x+1, ack = y+1)           |
+   |---------------------------------------->|
+   |                                         |
+   |         CONNECTION CLOSED               |
+   |                                         |
+
+    ### WARNING:
+    The server CAN and SHOULD combine steps 2 and 3 into a single FIN-ACK packet. This is the standard and recommended behavior.
+
+    ### Step 1: FIN (Active Close)
+    - The client sends: Packet with the FIN flag
+    - Contains:
+      - Sequence number = x (last sequence number + 1)
+      - Acknowledgment number = y (acknowledges server's data)
+      - FIN flag indicates no more data from client
+    - FIN occupies 1 byte in sequence space
+
+    ### Step 2: ACK (Passive Close - Server acknowledges FIN)
+    - The server must send a packet with the ACK flag
+    - Contains:
+      - Sequence number = y (server's next sequence number)
+      - Acknowledgment number = x + 1 (acknowledges client's FIN)
+    - This ACK confirms receipt of client's FIN
+    - Server enters CLOSE-WAIT state
+
+    ### Step 3: FIN (Server initiates its own close)
+    - The server sends: Packet with the FIN flag
+    - Contains:
+      - Sequence number = y (server's current sequence number)
+      - Acknowledgment number = x + 1 (still acknowledging client's FIN)
+    - Server enters LAST-ACK state
+
+    ### Step 4: ACK (Final acknowledgment)
+    - The client sends: Packet with the ACK flag
+    - Contains:
+      - Sequence number = x + 1 (client's next sequence number)
+      - Acknowledgment number = y + 1 (acknowledges server's FIN)
+    - Client enters TIME-WAIT state
+    - Server closes connection after receiving this ACK
+
+    ## Key Points
+
+    ### FIN Flag Semantics:
+    - FIN indicates the sender has no more data to send
+    - FIN occupies 1 byte in the sequence number space
+    - Each direction must be closed independently
+    - Both sides must send and acknowledge FIN for full closure
+
+    ### Sequence Number Handling:
+    - FIN consumes one sequence number: seq = last_seq + 1
+    - ACK for FIN: ack = received_seq + 1
+    - After sending FIN, sender cannot send more data
+    - Receiver can still send data after receiving FIN (half-close)
+
+    ### State Transitions:
+    - FIN-WAIT-1: After sending FIN, waiting for ACK
+    - FIN-WAIT-2: After receiving ACK for FIN, waiting for peer's FIN
+    - CLOSE-WAIT: After receiving FIN, waiting for application to close
+    - LAST-ACK: After sending FIN, waiting for final ACK
+    - TIME-WAIT: After sending final ACK, waiting for possible retransmissions
+    - CLOSED: Connection fully terminated
+
+    ### Important Considerations:
+    1. **Half-Close**: After receiving FIN, server can still send data
+    2. **Retransmission**: Lost FIN packets are retransmitted
+    3. **Simultaneous Close**: Both sides can send FIN at the same time
+    4. **TIME-WAIT**: Prevents delayed packets from interfering with new connections
+    5. **RST Alternative**: Instead of FIN, connection can be aborted with RST
+
+    ### FIN vs RST:
+    - **FIN**: Graceful close, completes pending data transmission
+    - **RST**: Abrupt close, discards pending data, immediate termination
+    - FIN requires 4-way handshake, RST is immediate
+
+    ### Common Issues:
+    1. **FIN Retransmission**: If ACK not received, FIN is retransmitted
+    2. **Half-Open Connections**: When one side crashes without sending FIN
+    3. **Orphaned Connections**: FIN sent but never acknowledged
+    4. **TIME-WAIT Accumulation**: Many connections in TIME-WAIT state
+*/
 static __always_inline int handle_tcp_fin(
     struct ethhdr *eth,
     struct iphdr *ip,
@@ -169,13 +423,20 @@ static __always_inline int handle_tcp_fin(
     __u32 payload_len,
     __u8* data_end
 ) {
+    struct connection_key key = {
+        .src_ip = ip->saddr,
+        .dst_ip = ip->daddr,
+        .src_port = tcp->source,
+        .dst_port = tcp->dest,
+    };
+    struct connection_state *state = bpf_map_lookup_elem(&tcp_connections, &key);
+    if (!state) {
+        return XDP_DROP;
+    }
+
     // Сохраняем оригинальные значения sequence numbers
     __be32 orig_seq = tcp->seq;
     __be32 orig_ack = tcp->ack_seq;
-
-    bpf_printk("=== handle_tcp_fin ===");
-    bpf_printk("Original: seq=%u, ack=%u, payload_len=%d",
-               bpf_ntohl(orig_seq), bpf_ntohl(orig_ack), payload_len);
 
     // Меняем местами MAC адреса (source <-> destination)
     swap_mac(eth);
@@ -212,16 +473,14 @@ static __always_inline int handle_tcp_fin(
     compute_ipv4_checksum(ip);
     compute_tcp_checksum(ip, (__u16*)tcp, data_end);
 
-    bpf_printk("Sending FIN-ACK: seq=%u, ack=%u",
-               bpf_ntohl(tcp->seq), bpf_ntohl(tcp->ack_seq));
-    bpf_printk("Connection closing gracefully");
+    (void)bpf_map_delete_elem(&tcp_connections, &key);
     return XDP_TX;
 }
 
 // XDP (eXpress Data Path) program section
 // This function is called for every packet received on the interface
 SEC("xdp")
-int xdp_redirect_all(struct xdp_md *ctx)
+int xdp_tcp_echo_server(struct xdp_md *ctx)
 {
     __u8 *data_end = (__u8 *)(long)ctx->data_end;
     __u8 *data = (__u8 *)(long)ctx->data;
@@ -286,12 +545,11 @@ int xdp_redirect_all(struct xdp_md *ctx)
 
     /* Dump basic TCP packet information */
     bpf_printk("=== TCP Packet Info ===");
-    /* CORRECT: Use %pI4 for IP addresses */
+
     bpf_printk("SRC IP: %pI4:%d -> DST IP: %pI4:%d",
                &ip->saddr, bpf_ntohs(tcp->source),
                &ip->daddr, bpf_ntohs(tcp->dest));
 
-    /* TCP Flags */
     bpf_printk("TCP Flags: [%s%s%s%s%s%s]",
                tcp->fin ? "FIN " : "",
                tcp->syn ? "SYN " : "",
@@ -300,7 +558,6 @@ int xdp_redirect_all(struct xdp_md *ctx)
                tcp->ack ? "ACK " : "",
                tcp->urg ? "URG" : "");
 
-    /* TCP Header information */
     bpf_printk("TCP Header: seq=%u ack=%u doff=%d (hdr_len=%d, payload_len=%d) window=%d",
                bpf_ntohl(tcp->seq),
                bpf_ntohl(tcp->ack_seq),
@@ -311,26 +568,18 @@ int xdp_redirect_all(struct xdp_md *ctx)
 
     bpf_printk("================================\n");
 
-
     if (tcp->syn) {
-        // Start three-way handshake process
+        // Start three-way handshake(tcp connection) process
         return handle_tcp_syn(eth, ip, tcp, data_end);
     }
     if (tcp->fin) {
         return handle_tcp_fin(eth, ip, tcp, payload, payload_len, data_end);;
     }
-
-    if (tcp->ack && payload_len == 0) {
-        // bpf_printk("ACK packet (handshake completion) - connection established");
-        // Сохранить состояние соединения (опционально)
-        // Но НЕ отправлять ответ
-        return XDP_DROP;
+    if (tcp->ack) {
+        return handle_tcp_ack(eth, ip, tcp, payload, payload_len, data_end);
     }
-
-
-    if (payload_len > 0) {
-        //bpf_printk("Handle non zer tcp payload\n");
-        return handle_tcp_echo(eth, ip, tcp, payload, payload_len, data_end);
+    if (tcp->rst) {
+        return handle_tcp_rst(eth, ip, tcp, payload, payload_len, data_end);
     }
 
     return XDP_PASS;

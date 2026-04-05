@@ -34,10 +34,7 @@ typedef struct tls_record {
 SEC("tc/ingress")
 int tc_ingress(struct __sk_buff *skb) {
     bpf_printk("tc.ingress");
-
-    __u8 *data_end = (__u8*)(long)skb->data_end;
-    __u8 *data = (__u8*)(long)skb->data;
-    dump_tcp(data, data_end);
+    dump_tcp(skb);
     return TC_ACT_OK;
 
 

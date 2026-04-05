@@ -154,3 +154,25 @@ static inline void compute_ipv4_checksum(struct iphdr* ip) {
     ip->check = 0;
     ip->check = csum_fold_helper(bpf_csum_diff(0, 0, (__be32*)ip, sizeof(*ip), 0));
 }
+
+static __always_inline void swap_mac(struct ethhdr *eth)
+{
+    __u8 tmp[ETH_ALEN];
+    __builtin_memcpy(tmp, eth->h_dest, ETH_ALEN);
+    __builtin_memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+    __builtin_memcpy(eth->h_source, tmp, ETH_ALEN);
+}
+
+static __always_inline void swap_ip(struct iphdr *ip)
+{
+    __u32 tmp = ip->saddr;
+    ip->saddr = ip->daddr;
+    ip->daddr = tmp;
+}
+
+static __always_inline void swap_tcp(struct tcphdr *tcp)
+{
+    __u16 tmp = tcp->source;
+    tcp->source = tcp->dest;
+    tcp->dest = tmp;
+}
