@@ -9,12 +9,15 @@
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+#define MAX_TLS_RECORDS (36)
 
 /* Common version values */
-#define SSL_3_0     0x0300
-#define TLS_1_0     0x0301
-#define TLS_1_1     0x0302
-#define TLS_1_2     0x0303
+typedef enum tls_version {
+    SSL_3_0 = 0x0300,
+    TLS_1_0 = 0x0301,
+    TLS_1_1 = 0x0302,
+    TLS_1_2 = 0x0303,
+} tls_version_t;
 
 /* Content Type Enumeration */
 typedef enum tls_content_type {
@@ -49,207 +52,142 @@ enum tls_handshake_message_type {
 typedef struct tls_handshake {
     __u8  msg_type;      // offset 0: тип сообщения
     __u8  length[3];     // offset 1-3: длина body (24-bit, big-endian!)
+    __u8  body[0];       // variable: TLS handshake body
 } __attribute__((packed)) tls_handshake_t;
 
-typedef struct tls_client_hello {
-    /* Part 1: Fixed fields */
-    __u16 client_version;           // offset 0-1: TLS version client supports
-    
-    /* Part 2: Random (32 bytes) */
-    __u8  random[32];               // offset 2-33: 4 bytes timestamp + 28 random
-    
-    /* Part 3: Session ID */
-    __u8  session_id_len;           // offset 34: length of session ID
-    __u8  session_id[0];            // variable: session ID (if any)
-    
-    /* Part 4: Cipher Suites */
-    __u16 cipher_suites_len;        // length in bytes
-    __u16 cipher_suites[0];         // variable: list of cipher suites (each 2 bytes)
-    
-    /* Part 5: Compression Methods */
-    __u8  compression_methods_len;  // length in bytes
-    __u8  compression_methods[0];   // variable: list of compression methods
-    
-    /* Part 6: Extensions */
-    __u16 extensions_len;           // length in bytes
-    __u8  extensions[0];            // variable: TLS extensions
-} __attribute__((packed)) tls_client_hello_t;
-
-typedef struct tls_server_hello {
-    /* Part 1: Fixed fields */
-    __u16 server_version;           // offset 0-1: chosen TLS version
-    
-    /* Part 2: Random (32 bytes) */
-    __u8  random[32];               // offset 2-33: server random
-    
-    /* Part 3: Session ID */
-    __u8  session_id_len;           // offset 34: length of session ID
-    __u8  session_id[0];            // variable: session ID
-    
-    /* Part 4: Chosen parameters */
-    __u16 cipher_suite;             // chosen cipher suite (2 bytes)
-    __u8  compression_method;       // chosen compression method
-    
-    /* Part 5: Extensions (optional, TLS 1.3 requires them) */
-    __u16 extensions_len;           // may be present
-    __u8  extensions[0];            // variable: TLS extensions
-} __attribute__((packed)) tls_server_hello_t;
-
-static __always_inline void parse_extensions(__u8 *ext_data, __u8 *ext_end, __u8* data_end) {
-    __u8 *ptr = ext_data;
-
-    bpf_printk("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
-    while (ptr + 4 <= ext_end) {
-        __u16 ext_type = (ptr[0] << 8) | ptr[1];
-        __u16 ext_len = (ptr[2] << 8) | ptr[3];
-        __u8 *ext_value = ptr + 4;
-        
-        if (ext_value + ext_len > ext_end) {
-            bpf_printk("  Extension truncated");
-            break;
-        }
-        
-        bpf_printk("  Extension: type=%d (0x%04x) len=%d", ext_type, ext_type, ext_len);
-        
-        switch (ext_type) {
-            case 0:  // server_name (SNI)
-                if (ext_len >= 3) {
-                    // Skip name_type (1 byte) and name_len (2 bytes)
-                    __u8 name_type = ext_value[0];
-                    __u16 name_len = (ext_value[1] << 8) | ext_value[2];
-                    if (name_len > 0 && ext_len >= 3 + name_len) {
-                        bpf_printk("    SNI: %s", ext_value + 3);
-                    }
-                }
-                break;
-                
-            case 10: // supported_groups
-                if (ext_len >= 2) {
-                    __u16 groups_len = (ext_value[0] << 8) | ext_value[1];
-                    bpf_printk("    Supported groups: %d", groups_len / 2);
-                }
-                break;
-                
-            case 13: // signature_algorithms
-                bpf_printk("    Signature algorithms");
-                break;
-                
-            case 16: // ALPN
-                bpf_printk("    ALPN");
-                break;
-                
-            case 43: // supported_versions
-                bpf_printk("    Supported versions");
-                break;
-                
-            case 51: // key_share
-                bpf_printk("    Key share");
-                break;
-        }
-        
-        ptr = ext_value + ext_len;
-        bpf_printk("%p", ptr);
-    }
+// Функция для преобразования 24-bit big-endian в uint32_t
+static inline __u32 get_tls_handshake_length(struct tls_handshake* handshake) {
+    return (handshake->length[0] << 16) | (handshake->length[1] << 8) | handshake->length[2];
 }
 
-static __always_inline void handle_tsl_handshake(struct tls_handshake* handshake, __u32 tls_payload_len, __u8* data_end) {
-    bpf_printk("TLS handshake: type=%d, len=%d", handshake->msg_type, handshake->length);
+// typedef struct tls_client_hello {
+//     /* Part 1: Fixed fields */
+//     __u16 client_version;           // offset 0-1: TLS version client supports
+    
+//     /* Part 2: Random (32 bytes) */
+//     __u8  random[32];               // offset 2-33: 4 bytes timestamp + 28 random
+    
+//     /* Part 3: Session ID */
+//     __u8  session_id_len;           // offset 34: length of session ID
+//     __u8  session_id[0];            // variable: session ID (if any)
+    
+//     /* Part 4: Cipher Suites */
+//     __u16 cipher_suites_len;        // length in bytes
+//     __u16 cipher_suites[0];         // variable: list of cipher suites (each 2 bytes)
+    
+//     /* Part 5: Compression Methods */
+//     __u8  compression_methods_len;  // length in bytes
+//     __u8  compression_methods[0];   // variable: list of compression methods
+    
+//     /* Part 6: Extensions */
+//     __u16 extensions_len;           // length in bytes
+//     __u8  extensions[0];            // variable: TLS extensions
+// } __attribute__((packed)) tls_client_hello_t;
+
+// typedef struct tls_server_hello {
+//     /* Part 1: Fixed fields */
+//     __u16 server_version;           // offset 0-1: chosen TLS version
+    
+//     /* Part 2: Random (32 bytes) */
+//     __u8  random[32];               // offset 2-33: server random
+    
+//     /* Part 3: Session ID */
+//     __u8  session_id_len;           // offset 34: length of session ID
+//     __u8  session_id[0];            // variable: session ID
+    
+//     /* Part 4: Chosen parameters */
+//     __u16 cipher_suite;             // chosen cipher suite (2 bytes)
+//     __u8  compression_method;       // chosen compression method
+    
+//     /* Part 5: Extensions (optional, TLS 1.3 requires them) */
+//     __u16 extensions_len;           // may be present
+//     __u8  extensions[0];            // variable: TLS extensions
+// } __attribute__((packed)) tls_server_hello_t;
+
+static __always_inline void handle_tsl_handshake(struct tls_handshake* handshake, __u8* data_end) {
+    const __u32 handshake_len = get_tls_handshake_length(handshake);
+    bpf_printk("TLS handshake: type=%d, len=%d", handshake->msg_type, handshake_len);
+
     switch (handshake->msg_type) {
         case CLIENT_HELLO: {
-            struct tls_client_hello* client_hello = (struct tls_client_hello*)(handshake + 1);
-            if ((__u8*)(client_hello + 1) > data_end) {
-                return;
-            }
-            bpf_printk("ClientHello: extension len=%d", client_hello->extensions_len);
-            __u16 len = bpf_ntohs(client_hello->extensions_len);
-            __u8* ext = &client_hello->extensions[0];
-            __u8* ext_end = ext + len;
-            bpf_printk("len=%d", len);
-            if (ext <= ext_end || ext_end > data_end) {
-                bpf_printk("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@: client hello extensions len%d", len);
-                return;
-            }
-            // if (ext_end > data_end ) {
-            //     bpf_printk("222222222222222222222222222222222222222222");
-            //     return;
-            // }
-            // if (ext_end > data_end || ext <= ext_end) {
-            //     bpf_printk("1111111111111111111111111111111111111111: %d",  client_hello->extensions_len);
-            //     return;
-            // }
-            parse_extensions(ext, ext_end, data_end);
+            bpf_printk("ClientHello");
             break;
         }
         case SERVER_HELLO: {
-            struct tls_server_hello* server_hello = (struct tls_server_hello*)(handshake + 1);
-            if ((__u8*)(server_hello + 1) > data_end) {
-                return;
-            }
-            bpf_printk("ClientHello: extension len=%d", server_hello->extensions_len);
+            bpf_printk("ServerHello");
             break;
         }
         default: break;
     }
 }
 
-static __always_inline int handle_tsl(__u8* tcp_payload, __u32 tcp_payload_len, __u8* data_end) {
-    /* Parse TLS Record */
-    struct tls_record *tls_record = (struct tls_record*)tcp_payload;
-    if ((__u8*)(tls_record + 1) > data_end) {
-        return TC_ACT_OK;
-    }
-
-    /* Validate TLS content type */
-    __u8 tls_content_type = tls_record->content_type;
-    switch (tls_content_type) {
-        case change_cipher_spec:
-        case alert:
-        case handshake: {
-            if ((__u8*)(tls_record + 1) >= data_end) {
-                bpf_printk("$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$$4");
-                return TC_ACT_OK;
-            }
-            handle_tsl_handshake((struct tls_handshake*)(tls_record + 1), tcp_payload_len, data_end);
-            break;
+static __always_inline int handle_tls(__u8* tcp_payload, __u32 tcp_payload_len, __u8* data_end) {
+    #pragma unroll
+    for (int i = 0; i < MAX_TLS_RECORDS; ++i) {
+         /* Parse TLS Record */
+        if (tcp_payload >= data_end || tcp_payload_len < sizeof(struct tls_record)) {
+            return TC_ACT_OK;
         }
-        case application_data: {
-            bpf_printk("TLS RECORD: content type=Application Data");
-            break;
-        } 
-        default:
-            bpf_printk("Invalid tls content type: %d", tls_content_type);
+
+        struct tls_record *tls_record = (struct tls_record*)tcp_payload;
+        // if ((__u8*)(tls_record + 1) > data_end) {
+        //     return TC_ACT_OK;
+        // }
+
+        /* Validate length (max 2^14 = 16384 per RFC 5246) */
+        __u16 tls_record_length = bpf_ntohs(tls_record->length);
+        __u8 *tls_record_end = tcp_payload + sizeof(struct tls_record) + tls_record_length;
+        if (tls_record_end > data_end || tls_record_length > 16384) {
             return TC_ACT_OK;
-    }
+        }
 
-    /* Validate TLS version */
-    __u16 tls_version = bpf_ntohs(tls_record->version);
-    switch (tls_version) {
-        case SSL_3_0:
-        case TLS_1_0:
-        case TLS_1_1:
-        case TLS_1_2:
-            break;
-        default:
-            bpf_printk("Invalid tls version: %d", tls_version);
-            return TC_ACT_OK;
-    }
+         /* Validate TLS version */
+        __u16 tls_record_version = bpf_ntohs(tls_record->version);
+        switch (tls_record_version) {
+            case SSL_3_0:
+            case TLS_1_0:
+            case TLS_1_1:
+            case TLS_1_2:
+                break;
+            default:
+                bpf_printk("Invalid tls version: %d", tls_record_version);
+                return TC_ACT_OK;
+        }
 
-    /* Validate length (max 2^14 = 16384 per RFC 5246) */
-    __u16 tls_payload_length = bpf_ntohs(tls_record->length);
-    if (tls_payload_length > 16384) {
-        bpf_printk("Invalid tls pyalod length: %d", tls_payload_length);
-        return TC_ACT_OK;
-    }
+         /* Handle TLS content type */
+        __u8 tls_record_content_type = tls_record->content_type;
+        switch (tls_record_content_type) {
+            case application_data: {
+                bpf_printk("TLS RECORD: content type=Application Data");
+                break;
+            }
+            case handshake: {
+                struct tls_handshake* handshake = (struct tls_handshake*)(tls_record + 1);
+                if ((__u8*)(handshake + 1) > tls_record_end) {
+                    return TC_ACT_OK;
+                }
 
-    /* Check if full TLS payload is present */
-    __u8 *tls_payload_end = (__u8*)tls_record + sizeof(struct tls_record) + tls_payload_length;
-    if (tls_payload_end > data_end) {
-        bpf_printk("Fragmented or incomlete tls");
-        return TC_ACT_OK;  /* Fragmented or incomplete */
-    }
+                __u32 handshake_len = get_tls_handshake_length(handshake);
+                if ((__u8*)handshake + sizeof(struct tls_handshake) + handshake_len > tls_record_end) {
+                    return TC_ACT_OK;
+                }
 
-    /* Log TLS record info */
-    bpf_printk("TLS %d version=0x%04x length=%u", tls_content_type, tls_version, tls_payload_length);
+                handle_tsl_handshake(handshake, tls_record_end);
+                break;
+            }
+            case change_cipher_spec: break; // skip: TODO
+            case alert: break; // skip: TODO
+            default:
+                bpf_printk("Invalid tls content type: %d", tls_record_content_type);
+                return TC_ACT_OK;
+        }
+
+         /* Log TLS record info */
+        bpf_printk("TLST RECORD: content_type=%d, version=%d, length=%d", tls_record_content_type, tls_record_version, tls_record_length);
+        tcp_payload = tls_record_end;
+        tcp_payload_len -= data_end - tcp_payload;
+        //tcp_payload_len -= sizeof(struct tls_record) + tls_record_length;
+    }
     return TC_ACT_OK;
 }
 
@@ -323,31 +261,31 @@ static __always_inline int parse_tcp(struct __sk_buff *skb) {
         return TC_ACT_OK;
     }
 
-    // /* Dump basic TCP packet information */
-    // bpf_printk("=== TCP Packet Info ===");
+    /* Dump basic TCP packet information */
+    bpf_printk("=== TCP Packet Info ===");
 
-    // bpf_printk("SRC IP: %pI4:%d -> DST IP: %pI4:%d",
-    //            &ip->saddr, bpf_ntohs(tcp->source),
-    //            &ip->daddr, bpf_ntohs(tcp->dest));
+    bpf_printk("SRC IP: %pI4:%d -> DST IP: %pI4:%d",
+               &ip->saddr, bpf_ntohs(tcp->source),
+               &ip->daddr, bpf_ntohs(tcp->dest));
 
-    // bpf_printk("TCP Flags: [%s%s%s%s%s%s]",
-    //            tcp->fin ? "FIN " : "",
-    //            tcp->syn ? "SYN " : "",
-    //            tcp->rst ? "RST " : "",
-    //            tcp->psh ? "PSH " : "",
-    //            tcp->ack ? "ACK " : "",
-    //            tcp->urg ? "URG" : "");
+    bpf_printk("TCP Flags: [%s%s%s%s%s%s]",
+               tcp->fin ? "FIN " : "",
+               tcp->syn ? "SYN " : "",
+               tcp->rst ? "RST " : "",
+               tcp->psh ? "PSH " : "",
+               tcp->ack ? "ACK " : "",
+               tcp->urg ? "URG" : "");
 
-    // bpf_printk("TCP Header: seq=%u ack=%u doff=%d payload_len=%d window=%d",
-    //            bpf_ntohl(tcp->seq),
-    //            bpf_ntohl(tcp->ack_seq),
-    //            tcp->doff,
-    //            tcp_payload_len,
-    //            bpf_ntohs(tcp->window));
+    bpf_printk("TCP Header: seq=%u ack=%u doff=%d payload_len=%d window=%d",
+               bpf_ntohl(tcp->seq),
+               bpf_ntohl(tcp->ack_seq),
+               tcp->doff,
+               tcp_payload_len,
+               bpf_ntohs(tcp->window));
 
     if (tcp_payload_len == 0) {
         return TC_ACT_OK;
     }
 
-    return handle_tsl(tcp_payload, tcp_payload_len, data_end);
+    return handle_tls(tcp_payload, tcp_payload_len, data_end);
 }
