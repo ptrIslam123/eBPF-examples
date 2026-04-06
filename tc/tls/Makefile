@@ -48,35 +48,71 @@ setup-network:
 		echo "ERROR: namespace $(NET_NS) already exists" >&2; \
 		exit 1; \
 	fi
+
 	@# Create namespace
 	sudo ip netns add $(NET_NS)
-	@# Create veth pair with one end in namespace
+
+	@# Create veth pair
 	sudo ip link add $(VETH1) type veth peer name $(VETH2) netns $(NET_NS)
+
 	@# Configure host side
 	sudo ip addr add $(VETH1_IP)/$(NETMASK) dev $(VETH1)
 	sudo ip link set $(VETH1) up
+
 	@# Configure namespace side
 	sudo ip -n $(NET_NS) addr add $(VETH2_IP)/$(NETMASK) dev $(VETH2)
 	sudo ip -n $(NET_NS) link set $(VETH2) up
 	sudo ip -n $(NET_NS) route add default via $(VETH1_IP)
+
 	@# Enable IP forwarding
 	echo 1 | sudo tee /proc/sys/net/ipv4/ip_forward > /dev/null
-	@# Add NAT (exclude traffic going out veth1 to avoid loop)
-	sudo iptables -t nat -A POSTROUTING -s $(NETWORK) ! -o $(VETH1) -j MASQUERADE
+
+	@# ===== УНИВЕРСАЛЬНОЕ РЕШЕНИЕ =====
+	@# Это правило работает ВСЕГДА, независимо от VPN
+	@# Оно маскарадит ВЕСЬ трафик из namespace, КРОМЕ возвращающегося через veth1
+	sudo iptables -t nat -A POSTROUTING -s $(NETWORK) -j MASQUERADE
+
+	@# Разрешаем форвардинг для veth1
+	sudo iptables -A FORWARD -i $(VETH1) -j ACCEPT
+	sudo iptables -A FORWARD -o $(VETH1) -j ACCEPT
+
+	@# Разрешаем установленные соединения
+	sudo iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+	@# Настройка DNS для namespace
+	sudo mkdir -p /etc/netns/$(NET_NS)
+	echo "nameserver 8.8.8.8" | sudo tee /etc/netns/$(NET_NS)/resolv.conf > /dev/null
+	echo "nameserver 1.1.1.1" | sudo tee -a /etc/netns/$(NET_NS)/resolv.conf > /dev/null
+
+	@# Определяем, какой интерфейс используется для интернета
+	$(eval DEFAULT_IFACE := $(shell ip route | grep default | awk '{print $$5}' | head -1))
+
 	@echo ""
-	@echo "✓ veth pair setup complete"
-	@echo "  Host: $(VETH1) = $(VETH1_IP)"
-	@echo "  Namespace: $(NET_NS) = $(VETH2_IP) (via $(VETH2))"
+	@echo "✓ Setup complete"
+	@echo "  Namespace: $(NET_NS) = $(VETH2_IP)"
+	@echo "  Host veth: $(VETH1) = $(VETH1_IP)"
+	@echo "  Default interface: $(DEFAULT_IFACE)"
 	@echo ""
-	@echo "Test: sudo ip netns exec $(NET_NS) ping 8.8.8.8"
+	@echo "Test: make test-network"
 
 cleanup-network:
-	@# Remove iptables rules (ignore if they don't exist)
-	-sudo iptables -t nat -D POSTROUTING -s $(NETWORK) ! -o $(VETH1) -j MASQUERADE 2>/dev/null
-	@# Delete namespace (ignore if it doesn't exist)
+	@# Удаляем универсальное правило NAT
+	-sudo iptables -t nat -D POSTROUTING -s $(NETWORK) -j MASQUERADE 2>/dev/null
+
+	@# Удаляем правила FORWARD
+	-sudo iptables -D FORWARD -i $(VETH1) -j ACCEPT 2>/dev/null
+	-sudo iptables -D FORWARD -o $(VETH1) -j ACCEPT 2>/dev/null
+	-sudo iptables -D FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null
+
+	@# Удаляем namespace
 	-sudo ip netns delete $(NET_NS) 2>/dev/null
-	@# Clean up host veth if needed
+
+	@# Удаляем veth интерфейс
 	-sudo ip link delete $(VETH1) 2>/dev/null
+
+	@# Удаляем DNS настройки
+	-sudo rm -rf /etc/netns/$(NET_NS) 2>/dev/null
+
 	@echo "✓ Cleanup complete"
 
 status:
