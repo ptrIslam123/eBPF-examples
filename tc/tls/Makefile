@@ -4,8 +4,11 @@ BPF_CFLAGS = -O2 -g -Wall -target bpf \
              -D__KERNEL__ \
              -I/usr/include \
              -I/usr/include/x86_64-linux-gnu
-INGRESS_KPROG=kprog.ingress
-EGRESS_KPROG=kprog.egress
+CXXFLAGS = -std=c++17 -Wall -g
+LDFLAGS = -lstdc++ -lbpf -lpthread -lelf -lz
+
+KPROG=kprog
+UPROG=uspace
 
 
 NET_NS := test_ns
@@ -158,10 +161,7 @@ load-bpf:
 	sudo tc qdisc replace dev $(VETH1) clsact
 	
 	# 2. Загружаем программу на ingress
-	sudo tc filter add dev $(VETH1) ingress bpf da obj $(INGRESS_KPROG).o sec tc/ingress
-	
-	# 3. Загружаем программу на egress
-	sudo tc filter add dev $(VETH1) egress bpf da obj $(EGRESS_KPROG).o sec tc/egress
+	sudo tc filter add dev $(VETH1) ingress bpf da obj $(KPROG).o sec tc/ingress
 	
 	@echo "TC eBPF loaded on $(VETH1)"
 
@@ -171,13 +171,16 @@ unload-bpf:
 	@echo "TC eBPF unloaded from $(VETH1)"
 
 # Compile eBPF program
-compile: $(INGRESS_KPROG).o $(EGRESS_KPROG).o
+compile: $(KPROG).o $(UPROG)
 
 %.o: %.c
 	$(CLANG) $(BPF_CFLAGS) -c $< -o $@
+
+$(UPROG): $(UPROG).cpp
+	g++ -g $(CXXFLAGS) client_hello.cpp -o $@ $^ $(LDFLAGS)
 
 trace:
 	sudo cat /sys/kernel/debug/tracing/trace_pipe
 
 clean:
-	rm -f *.o
+	rm -f *.o $(UPROG)

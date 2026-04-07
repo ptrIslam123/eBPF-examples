@@ -10,8 +10,14 @@
 #include "tls_handler.h"
 
 SEC("tc/egress")
-int tc_ingress(struct __sk_buff *skb) {
+int tc_egress(struct __sk_buff *skb) {
     bpf_printk("tc.egress");
+    return parse_tcp(skb);
+}
+
+SEC("tc/ingress")
+int tc_ingress(struct __sk_buff *skb) {
+    bpf_printk("tc.ingress");
     return parse_tcp(skb);
 }
 

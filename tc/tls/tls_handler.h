@@ -1,16 +1,72 @@
-#pragma once
-
-#include <linux/bpf.h>
 #include <linux/pkt_cls.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/in.h>
+#include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
+#define MAX_TLS_DATA (2048)
 #define MAX_TLS_RECORDS (10)
-#define TLS_RECORD_HEADER_LEN 5
+#define TLS_RECORD_HEADER_LEN (5)
+
+struct tls_metadata {
+    __u64 timestamp_ns;
+    __u32 saddr;
+    __u32 daddr;
+    __u16 sport;
+    __u16 dport;
+    __u32 seq_num;
+    __u8  tls_record_type;
+    __u8  tls_version;
+    __u16 tls_record_len;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 1 << 24);
+    __uint(pinning, LIBBPF_PIN_BY_NAME);
+} tls_events SEC(".maps");
+
+#define SUBMIT_TLS_DATA(metadata, tls_data, tls_data_end, data_end) \
+    do { \
+        \
+        __u64 payload_len = (tls_data_end) - (tls_data); \
+        if (tls_data + payload_len > data_end) { \
+            bpf_printk("!!!!!!!!!!!!!!!!!!2"); \
+            break; \
+        } \
+        \
+        if (payload_len > MAX_TLS_DATA) { \
+            payload_len = MAX_TLS_DATA; \
+        } \
+        \
+        /* Резервируем место */ \
+        void *ringbuf_ptr = bpf_ringbuf_reserve(&tls_events, sizeof(struct tls_metadata) + MAX_TLS_DATA, 0); \
+        if (!ringbuf_ptr) { \
+            bpf_printk("!!!!!!!!!!!!!!!!!!3"); \
+            break; \
+        } \
+        \
+        /* Копируем метаданные */ \
+        if (bpf_probe_read_kernel(ringbuf_ptr, sizeof(struct tls_metadata), metadata) != 0) { \
+            bpf_ringbuf_discard(ringbuf_ptr, 0); \
+            bpf_printk("!!!!!!!!!!!!!!!!!!4"); \
+            break; \
+        } \
+        \
+        /* Копируем TLS данные */ \
+        if (bpf_probe_read_kernel((__u8*)ringbuf_ptr + sizeof(struct tls_metadata), payload_len, tls_data) != 0) { \
+            bpf_ringbuf_discard(ringbuf_ptr, 0); \
+            bpf_printk("!!!!!!!!!!!!!!!!!!5"); \
+            break; \
+        } \
+        \
+        bpf_ringbuf_submit(ringbuf_ptr, 0); \
+        bpf_printk("submit tls data: %d", sizeof(tls_data) + payload_len); \
+    } while(0)
+
 
 /* Common version values */
 typedef enum tls_version {
@@ -22,10 +78,10 @@ typedef enum tls_version {
 
 /* Content Type Enumeration */
 typedef enum tls_content_type {
-    change_cipher_spec = 20,
-    alert              = 21,
-    handshake          = 22,
-    application_data   = 23
+    CHANGE_CIPHER_SPEC = 20,
+    ALERT              = 21,
+    HANDSHAKE          = 22,
+    APPLICATION_DATA   = 23
 } tls_content_type_t;
 
 /* TLS Record Layer */
@@ -35,7 +91,6 @@ typedef struct tls_record {
     __u8 version_minor;
     __u16 length;
 } __attribute__((packed)) tls_record_t;
-
 
 enum tls_handshake_message_type {
     HELLO_REQUEST = 0,               //  0	hello_request	Запрос на повторное рукопожатие
@@ -62,99 +117,48 @@ static inline __u32 get_tls_handshake_length(struct tls_handshake* handshake) {
     return (handshake->length[0] << 16) | (handshake->length[1] << 8) | handshake->length[2];
 }
 
-// typedef struct tls_client_hello {
-//     /* Part 1: Fixed fields */
-//     __u16 client_version;           // offset 0-1: TLS version client supports
-    
-//     /* Part 2: Random (32 bytes) */
-//     __u8  random[32];               // offset 2-33: 4 bytes timestamp + 28 random
-    
-//     /* Part 3: Session ID */
-//     __u8  session_id_len;           // offset 34: length of session ID
-//     __u8  session_id[0];            // variable: session ID (if any)
-    
-//     /* Part 4: Cipher Suites */
-//     __u16 cipher_suites_len;        // length in bytes
-//     __u16 cipher_suites[0];         // variable: list of cipher suites (each 2 bytes)
-    
-//     /* Part 5: Compression Methods */
-//     __u8  compression_methods_len;  // length in bytes
-//     __u8  compression_methods[0];   // variable: list of compression methods
-    
-//     /* Part 6: Extensions */
-//     __u16 extensions_len;           // length in bytes
-//     __u8  extensions[0];            // variable: TLS extensions
-// } __attribute__((packed)) tls_client_hello_t;
+static __always_inline __u32 handle_tsl_handshake(
+    struct tls_metadata* metadata,
+    struct tls_handshake* handshake,
+    __u8* tls_record_end, __u8* data_end
+) {
+    __u8* payload = (__u8*)(handshake + 1);
+    if (payload > tls_record_end || payload > data_end) {
+        return TC_ACT_OK;
+    }
 
-// typedef struct tls_server_hello {
-//     /* Part 1: Fixed fields */
-//     __u16 server_version;           // offset 0-1: chosen TLS version
-    
-//     /* Part 2: Random (32 bytes) */
-//     __u8  random[32];               // offset 2-33: server random
-    
-//     /* Part 3: Session ID */
-//     __u8  session_id_len;           // offset 34: length of session ID
-//     __u8  session_id[0];            // variable: session ID
-    
-//     /* Part 4: Chosen parameters */
-//     __u16 cipher_suite;             // chosen cipher suite (2 bytes)
-//     __u8  compression_method;       // chosen compression method
-    
-//     /* Part 5: Extensions (optional, TLS 1.3 requires them) */
-//     __u16 extensions_len;           // may be present
-//     __u8  extensions[0];            // variable: TLS extensions
-// } __attribute__((packed)) tls_server_hello_t;
-
-// static __always_inline int handle_tls(__u8* tcp_payload, __u32 tcp_payload_len, __u8* data_end) {
-//     // 1. Сразу проверяем минимальный размер заголовка TLS (5 байт)
-//     // sizeof(struct tls_record) должен быть равен 5! Проверь свой struct.
-//     if (tcp_payload + sizeof(struct tls_record) > data_end) {
-//         return TC_ACT_OK;
-//     }
-
-//     struct tls_record* tls_record = (struct tls_record*)tcp_payload;
-
-//     // 2. Читаем длину. В TLS length - это 2 байта (uint16_t).
-//     // Убедись, что в struct tls_record поле length имеет тип __u16.
-//     __u32 tls_record_len = bpf_ntohs(tls_record->length);
-
-//     // Опционально: sanity check на адекватность длины (например, не больше 16KB)
-//     if (tls_record_len > 16384) {
-//         return TC_ACT_OK;
-//     }
-
-//     // 3. Проверяем, влезает ли ВСЯ запись (заголовок + контент) в пакет.
-//     // ВАЖНО: Считаем смещение от начала payload, чтобы избежать проблем с арифметикой указателей.
-//     __u32 total_tls_size = sizeof(struct tls_record) + tls_record_len;
-
-//     // Проверка на переполнение uint32 (маловероятно тут, но безопасно)
-//     if (total_tls_size < sizeof(struct tls_record)) {
-//         return TC_ACT_OK;
-//     }
-
-//     // Самая важная проверка для верификатора:
-//     // Мы сравниваем абсолютные адреса.
-//     if (tcp_payload + total_tls_size > data_end) {
-//         return TC_ACT_OK;
-//     }
-
-//     // 4. Теперь мы гарантированно знаем, что данные валидны.
-//     // Можно читать дальше или логировать.
-//     bpf_printk("TLS Content Len: %d", tls_record_len);
-
-//     return TC_ACT_OK;
-// }
+    metadata->tls_record_len = tls_record_end - payload;
+    switch (handshake->msg_type) {
+        case CLIENT_HELLO: {
+            bpf_printk("ClientHello");
+            metadata->tls_record_type = CLIENT_HELLO;
+            SUBMIT_TLS_DATA(metadata, payload, tls_record_end, data_end);
+            break;
+        }
+        case SERVER_HELLO: {
+            bpf_printk("ServerHello");
+            metadata->tls_record_type = SERVER_HELLO;
+            SUBMIT_TLS_DATA(metadata, payload, tls_record_end, data_end);
+            break;
+        }
+        case HELLO_REQUEST: { break; }
+        case NEW_SESSION_TICKET: { break; }
+        case CERTIFICATE: { break; }
+        case KEY_EXCHANGE: { break; }
+        case REQUEST_CERTIFICATE: { break; }
+        case SERVER_HELLO_DONE: { break; }
+        case CERTIFICATE_VERIFY: { break; }
+        case CLIENT_KEY_EXCHANGE: { break; }
+        case FINISHED: { break; }
+    }
+    return TC_ACT_OK;
+}
 
 
-// Структура должна быть определена выше
-// struct tls_record {
-//     __u8 content_type;
-//     __u16 version;
-//     __u16 length;
-// } __attribute__((packed)); // Важно: packed, чтобы sizeof был ровно 5
-
-static __always_inline __u32 handle_single_tls_record(__u8* payload_start, __u32 remaining_len, __u8* data_end) {
+static __always_inline __u32 handle_single_tls_record(
+    struct tls_metadata* metadata,
+    __u8 * payload_start, __u32 remaining_len, __u8* data_end
+) {
     // 1. Проверка: влезает ли минимальный заголовок (5 байт) в оставшиеся данные?
     if (remaining_len < sizeof(struct tls_record)) {
         return 0; // Недостаточно данных даже на заголовок
@@ -192,37 +196,40 @@ static __always_inline __u32 handle_single_tls_record(__u8* payload_start, __u32
      /* Handle TLS content type */
     __u8 tls_record_content_type = tls_record->content_type;
     switch (tls_record_content_type) {
-        case application_data: {
+        case APPLICATION_DATA: {
             bpf_printk("TLS RECORD: content type=Application Data");
             break;
         }
-        case handshake: {
-            bpf_printk("Handshake");
-            // struct tls_handshake* handshake = (struct tls_handshake*)(tls_record + 1);
-            // if ((__u8*)(handshake + 1) > tls_record_end) {
-            //     return TC_ACT_OK;
-            // }
+        case HANDSHAKE: {
+            bpf_printk("TLS RECORD: handshake");
+            struct tls_handshake* handshake = (struct tls_handshake*)(tls_record + 1);
+            if ((__u8*)(handshake + 1) > tls_record_end || (__u8*)(handshake + 1) > data_end) {
+                return TC_ACT_OK;
+            }
 
-            // __u32 handshake_len = get_tls_handshake_length(handshake);
-            // if ((__u8*)handshake + sizeof(struct tls_handshake) + handshake_len > tls_record_end) {
-            //     return TC_ACT_OK;
-            // }
+            __u32 handshake_len = get_tls_handshake_length(handshake);
+            if ((__u8*)(handshake + 1) + handshake_len > tls_record_end) {
+                return TC_ACT_OK;
+            }
 
-            //handle_tsl_handshake(handshake, tls_record_end);
+            metadata->tls_record_type = HANDSHAKE;
+            handle_tsl_handshake(metadata, handshake, tls_record_end, data_end);
             break;
         }
-        case change_cipher_spec: break; // skip: TODO
-        case alert: break; // skip: TODO
+        case CHANGE_CIPHER_SPEC: break; // skip: TODO
+        case ALERT: break; // skip: TODO
         default:
             bpf_printk("Invalid tls content type: %d", tls_record_content_type);
             return TC_ACT_OK;
     }
-
-
     return total_tls_record_size;
 }
 
-static __always_inline int handle_tls(__u8* tcp_payload, __u32 tcp_payload_len, __u8* data_end) {
+static __always_inline int handle_tls(
+    struct tls_metadata* metadata,
+    __u8* tcp_payload, __u32 tcp_payload_len,
+    __u8* data_end
+) {
     __u32 processed_bytes = 0;
     __u32 current_offset = 0;
 
@@ -231,6 +238,7 @@ static __always_inline int handle_tls(__u8* tcp_payload, __u32 tcp_payload_len, 
 
     // --- Запись 1 ---
     processed_bytes = handle_single_tls_record(
+        metadata,
         tcp_payload + current_offset,
         tcp_payload_len - current_offset,
         data_end
@@ -240,6 +248,7 @@ static __always_inline int handle_tls(__u8* tcp_payload, __u32 tcp_payload_len, 
 
     // --- Запись 2 ---
     processed_bytes = handle_single_tls_record(
+        metadata,
         tcp_payload + current_offset,
         tcp_payload_len - current_offset,
         data_end
@@ -249,6 +258,7 @@ static __always_inline int handle_tls(__u8* tcp_payload, __u32 tcp_payload_len, 
 
     // --- Запись 3 ---
     processed_bytes = handle_single_tls_record(
+        metadata,
         tcp_payload + current_offset,
         tcp_payload_len - current_offset,
         data_end
@@ -260,88 +270,6 @@ static __always_inline int handle_tls(__u8* tcp_payload, __u32 tcp_payload_len, 
 
     return TC_ACT_OK;
 }
-
-// static __always_inline int handle_tls(__u8* tcp_payload, __u32 tcp_payload_len, __u8* data_end) {
-//     #pragma unroll
-//     for (int i = 0; i < MAX_TLS_RECORDS; ++i) {
-//          /* Parse TLS Record */
-//         if (tcp_payload > data_end || tcp_payload_len < sizeof(struct tls_record)) {
-//             return TC_ACT_OK;
-//         }
-
-//         struct tls_record *tls_record = (struct tls_record*)tcp_payload;
-//         if ((__u8*)(tls_record + 1) > data_end) {
-//             return TC_ACT_OK;
-//         }
-
-//         __u16 tls_record_length = bpf_ntohs(tls_record->length);
-//         bpf_printk("%d", tls_record_length);
-
-//         __u8* next_tls_record = (__u8*)(tls_record + 1) + tls_record_length;
-//         if (next_tls_record >= data_end) {
-//             return TC_ACT_OK;
-//         }
-//         bpf_printk("%c", *next_tls_record);
-//         // /* Validate TLS version */
-//         // __u16 tls_record_version = bpf_ntohs(tls_record->version);
-//         // switch (tls_record_version) {
-//         //     case SSL_3_0:
-//         //     case TLS_1_0:
-//         //     case TLS_1_1:
-//         //     case TLS_1_2:
-//         //         break;
-//         //     default:
-//         //         bpf_printk("Invalid tls version: %d", tls_record_version);
-//         //         return TC_ACT_OK;
-//         // }
-
-//         // /* Validate length (max 2^14 = 16384 per RFC 5246) */
-//         // __u16 tls_record_length = bpf_ntohs(tls_record->length);
-//         // bpf_printk("%d", tls_record_length);
-//         // if ((__u8*)tls_record + sizeof(struct tls_record) + tls_record_length > data_end) {
-//         //     return TC_ACT_OK;
-//         // }
-//         // __u8 *tls_record_end = (__u8*)tls_record + tls_record_length;
-//         // if (tls_record_end > data_end || tls_record_length > 16384) {
-//         //     return TC_ACT_OK;
-//         // }
-
-//          /* Handle TLS content type */
-//         // __u8 tls_record_content_type = tls_record->content_type;
-//         // switch (tls_record_content_type) {
-//         //     case application_data: {
-//         //         bpf_printk("TLS RECORD: content type=Application Data");
-//         //         break;
-//         //     }
-//         //     case handshake: {
-//         //         // struct tls_handshake* handshake = (struct tls_handshake*)(tls_record + 1);
-//         //         // if ((__u8*)(handshake + 1) > tls_record_end) {
-//         //         //     return TC_ACT_OK;
-//         //         // }
-
-//         //         // __u32 handshake_len = get_tls_handshake_length(handshake);
-//         //         // if ((__u8*)handshake + sizeof(struct tls_handshake) + handshake_len > tls_record_end) {
-//         //         //     return TC_ACT_OK;
-//         //         // }
-
-//         //         // handle_tsl_handshake(handshake, tls_record_end);
-//         //         break;
-//         //     }
-//         //     case change_cipher_spec: break; // skip: TODO
-//         //     case alert: break; // skip: TODO
-//         //     default:
-//         //         bpf_printk("Invalid tls content type: %d", tls_record_content_type);
-//         //         return TC_ACT_OK;
-//         // }
-
-//          /* Log TLS record info */
-//         //bpf_printk("TLST RECORD: content_type=%d, version=%d, length=%d", tls_record_content_type, tls_record_version, tls_record_length);
-//         //tcp_payload = tls_record_end;
-//         //tcp_payload_len -= data_end - tcp_payload;
-//         //tcp_payload_len -= sizeof(struct tls_record) + tls_record_length;
-//     }
-//     return TC_ACT_OK;
-// }
 
 static __always_inline int parse_tcp(struct __sk_buff *skb) {
     // =========================================================
@@ -413,6 +341,8 @@ static __always_inline int parse_tcp(struct __sk_buff *skb) {
         return TC_ACT_OK;
     }
 
+    struct tls_metadata metadata = {};
+
     /* Dump basic TCP packet information */
     bpf_printk("=== TCP Packet Info ===");
 
@@ -439,5 +369,5 @@ static __always_inline int parse_tcp(struct __sk_buff *skb) {
         return TC_ACT_OK;
     }
 
-    return handle_tls(tcp_payload, tcp_payload_len, data_end);
+    return handle_tls(&metadata, tcp_payload, tcp_payload_len, data_end);
 }
